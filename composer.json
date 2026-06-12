@@ -1,0 +1,31 @@
+{
+    "name": "stetodd/stripe-gateway-bundle",
+    "description": "Stripe implementation of stetodd/payment-gateway as a Symfony bundle",
+    "type": "symfony-bundle",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.4",
+        "psr/log": "^3.0",
+        "stetodd/payment-gateway": "*@dev",
+        "stripe/stripe-php": "^20.2",
+        "symfony/config": "^7.2|^8.0",
+        "symfony/dependency-injection": "^7.2|^8.0",
+        "symfony/http-foundation": "^7.2|^8.0",
+        "symfony/http-kernel": "^7.2|^8.0",
+        "symfony/serializer": "^7.2|^8.0",
+        "symfony/webhook": "^7.2|^8.0"
+    },
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../payment-gateway"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Stetodd\\StripeGatewayBundle\\": "src/"
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
