@@ -6,7 +6,7 @@
     "require": {
         "php": ">=8.4",
         "psr/log": "^3.0",
-        "stetodd/payment-gateway": "^0.1",
+        "stetodd/payment-gateway": "^0.2",
         "stripe/stripe-php": "^20.2",
         "symfony/config": "^7.2|^8.0",
         "symfony/dependency-injection": "^7.2|^8.0",
@@ -24,7 +24,7 @@
     "prefer-stable": true,
     "extra": {
         "branch-alias": {
-            "dev-main": "0.1.x-dev"
+            "dev-main": "0.2.x-dev"
         }
     }
 }
