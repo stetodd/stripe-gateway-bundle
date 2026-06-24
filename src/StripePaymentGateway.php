@@ -16,6 +16,7 @@ use Stetodd\PaymentGateway\Model\Request\Subscription\CancelSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\GetSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\ReactivateSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\UpdateSubscriptionPlanRequest;
+use Stetodd\PaymentGateway\Model\Request\Subscription\UpdateSubscriptionQuantityRequest;
 use Stetodd\PaymentGateway\Model\Subscription;
 use Stetodd\PaymentGateway\Model\Subscription\Status;
 use Stetodd\PaymentGateway\PaymentGatewayInterface;
@@ -115,6 +116,19 @@ class StripePaymentGateway implements PaymentGatewayInterface
             'items' => [['id' => $itemId, 'price' => $request->newPriceId]],
             'proration_behavior' => 'create_prorations',
             'cancel_at_period_end' => false,
+        ]);
+    }
+
+    public function updateSubscriptionQuantity(UpdateSubscriptionQuantityRequest $request): void
+    {
+        /** @psalm-suppress UndefinedMagicPropertyFetch, MixedPropertyFetch */
+        $items = $this->stripeClient->subscriptions->retrieve($request->subscriptionId)->items;
+        /** @psalm-suppress MixedPropertyFetch, MixedArrayAccess */
+        $itemId = $items->data[0]->id;
+
+        $this->stripeClient->subscriptions->update($request->subscriptionId, [
+            'items' => [['id' => $itemId, 'quantity' => $request->quantity]],
+            'proration_behavior' => 'create_prorations',
         ]);
     }
 
