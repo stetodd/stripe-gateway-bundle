@@ -27,8 +27,6 @@ class StripePaymentGateway implements PaymentGatewayInterface
 {
     public function __construct(
         private StripeClient $stripeClient,
-        private string $successUrl,
-        private string $cancelUrl,
         private ?LoggerInterface $logger = null,
     ) {
     }
@@ -46,8 +44,8 @@ class StripePaymentGateway implements PaymentGatewayInterface
             'customer' => $request->customer->id,
             'mode' => 'subscription',
             'line_items' => $lineItems,
-            'success_url' => $this->successUrl.'?session_id={CHECKOUT_SESSION_ID}',
-            'cancel_url' => $this->cancelUrl,
+            'success_url' => $request->successUrl.(str_contains($request->successUrl, '?') ? '&' : '?').'session_id={CHECKOUT_SESSION_ID}',
+            'cancel_url' => $request->cancelUrl,
             'metadata' => $request->getMetadata(),
         ]);
 

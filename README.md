@@ -21,18 +21,20 @@ The bundle binds `Stetodd\PaymentGateway\PaymentGatewayInterface` to `StripePaym
 Defaults read from env vars — set these and you need no bundle config at all:
 
 - `STRIPE_SECRET_KEY`
-- `STRIPE_CHECKOUT_SUCCESS_URL`
-- `STRIPE_CHECKOUT_CANCEL_URL`
 
 Or configure explicitly in `config/packages/stetodd_stripe_gateway.yaml`:
 
 ```yaml
 stetodd_stripe_gateway:
     secret_key: '%env(STRIPE_SECRET_KEY)%'
-    checkout_success_url: '%env(STRIPE_CHECKOUT_SUCCESS_URL)%'
-    checkout_cancel_url: '%env(STRIPE_CHECKOUT_CANCEL_URL)%'
     webhook_path: /webhook/stripe
 ```
+
+Checkout success/cancel URLs are per-request data: pass absolute URLs on
+`CreateCheckoutSessionRequest` (`successUrl`, `cancelUrl`), the same way the
+customer portal takes its `returnUrl`. The gateway appends
+`session_id={CHECKOUT_SESSION_ID}` to the success URL, joining with `&` when the
+URL already carries a query string.
 
 ## Webhooks
 

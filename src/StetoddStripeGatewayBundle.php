@@ -22,14 +22,12 @@ final class StetoddStripeGatewayBundle extends AbstractBundle
         $definition->rootNode()
             ->children()
                 ->scalarNode('secret_key')->defaultValue('%env(STRIPE_SECRET_KEY)%')->end()
-                ->scalarNode('checkout_success_url')->defaultValue('%env(STRIPE_CHECKOUT_SUCCESS_URL)%')->end()
-                ->scalarNode('checkout_cancel_url')->defaultValue('%env(STRIPE_CHECKOUT_CANCEL_URL)%')->end()
                 ->scalarNode('webhook_path')->defaultValue('/webhook/stripe')->end()
             ->end();
     }
 
     /**
-     * @param array{secret_key: string, checkout_success_url: string, checkout_cancel_url: string, webhook_path: string} $config
+     * @param array{secret_key: string, webhook_path: string} $config
      */
     public function loadExtension(array $config, ContainerConfigurator $container, ContainerBuilder $builder): void
     {
@@ -44,8 +42,6 @@ final class StetoddStripeGatewayBundle extends AbstractBundle
         $services->set(StripePaymentGateway::class)
             ->args([
                 service(StripeClient::class),
-                $config['checkout_success_url'],
-                $config['checkout_cancel_url'],
                 service('logger')->nullOnInvalid(),
             ]);
 
