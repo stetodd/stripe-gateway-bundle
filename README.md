@@ -50,3 +50,7 @@ framework:
 ```
 
 Consume events with a `#[AsRemoteEventConsumer('stripe')]` consumer in your app — that part is application-specific. `Stetodd\StripeGatewayBundle\Webhook\WebhookEvent` hydrates typed Stripe objects from the payload.
+
+## One-off holds (v0.4)
+
+`createPaymentHoldSession()` opens a Checkout Session in `payment` mode with `payment_intent_data[capture_method]=manual`, so the amount is authorised but not captured. The `checkout.session.completed` webhook's session carries the `payment_intent` id; capture it with `capturePayment()` on fulfilment or release it with `cancelPayment()`. Card authorisations last seven days.

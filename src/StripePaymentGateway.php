@@ -5,12 +5,19 @@ declare(strict_types=1);
 namespace Stetodd\StripeGatewayBundle;
 
 use Psr\Log\LoggerInterface;
+use Stetodd\PaymentGateway\Exception\Payment\PaymentNotFoundException;
 use Stetodd\PaymentGateway\Exception\Subscription\SubscriptionNotFoundException;
 use Stetodd\PaymentGateway\Model\Checkout\LineItem;
 use Stetodd\PaymentGateway\Model\Checkout\Session;
 use Stetodd\PaymentGateway\Model\Customer;
+use Stetodd\PaymentGateway\Model\Payment\Payment;
+use Stetodd\PaymentGateway\Model\Payment\PaymentStatus;
 use Stetodd\PaymentGateway\Model\Request\Checkout\CreateCheckoutSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Customer\CreateCustomerRequest;
+use Stetodd\PaymentGateway\Model\Request\Payment\CancelPaymentRequest;
+use Stetodd\PaymentGateway\Model\Request\Payment\CapturePaymentRequest;
+use Stetodd\PaymentGateway\Model\Request\Payment\CreatePaymentHoldRequest;
+use Stetodd\PaymentGateway\Model\Request\Payment\GetPaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Portal\CreatePortalSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\CancelSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\GetSubscriptionRequest;
@@ -21,6 +28,7 @@ use Stetodd\PaymentGateway\Model\Subscription;
 use Stetodd\PaymentGateway\Model\Subscription\Status;
 use Stetodd\PaymentGateway\PaymentGatewayInterface;
 use Stripe\Exception\InvalidRequestException;
+use Stripe\PaymentIntent;
 use Stripe\StripeClient;
 
 class StripePaymentGateway implements PaymentGatewayInterface
@@ -150,6 +158,111 @@ class StripePaymentGateway implements PaymentGatewayInterface
         ]);
 
         return new Customer($response->id, []);
+    }
+
+    /**
+     * A Checkout Session in payment mode with manual capture: Stripe authorises
+     * the amount and holds it until {@see capturePayment()} or
+     * {@see cancelPayment()}. Card authorisations last seven days for a
+     * customer-initiated transaction. The completed-checkout webhook's session
+     * carries the `payment_intent` id and this request's metadata.
+     */
+    public function createPaymentHoldSession(CreatePaymentHoldRequest $request): Session
+    {
+        $session = $this->stripeClient->checkout->sessions->create([
+            'customer' => $request->customer->id,
+            'mode' => 'payment',
+            'line_items' => [[
+                'quantity' => 1,
+                'price_data' => [
+                    'currency' => strtolower($request->currency),
+                    'unit_amount' => $request->amount,
+                    'product_data' => ['name' => $request->description],
+                ],
+            ]],
+            'payment_intent_data' => [
+                'capture_method' => 'manual',
+                'description' => $request->description,
+                'metadata' => $request->getMetadata(),
+            ],
+            'success_url' => $request->successUrl.(str_contains($request->successUrl, '?') ? '&' : '?').'session_id={CHECKOUT_SESSION_ID}',
+            'cancel_url' => $request->cancelUrl,
+            'metadata' => $request->getMetadata(),
+        ]);
+
+        $url = $session->url;
+        if ($url === null) {
+            $this->logger?->error('Stripe Checkout hold session URL is null', [
+                'customer_id' => $request->customer->id,
+                'amount' => $request->amount,
+                'session' => $session->toArray(),
+                'metadata' => $request->getMetadata(),
+            ]);
+
+            throw new \RuntimeException(sprintf('Stripe Checkout hold session URL is null for %s', $request->customer->id));
+        }
+
+        return new Session($url);
+    }
+
+    public function capturePayment(CapturePaymentRequest $request): Payment
+    {
+        $params = $request->amountToCapture !== null ? ['amount_to_capture' => $request->amountToCapture] : [];
+
+        try {
+            $intent = $this->stripeClient->paymentIntents->capture($request->paymentId, $params);
+        } catch (InvalidRequestException $e) {
+            throw new PaymentNotFoundException($request->paymentId, $e);
+        }
+
+        return $this->hydratePayment($intent);
+    }
+
+    public function cancelPayment(CancelPaymentRequest $request): Payment
+    {
+        $params = $request->reason !== null ? ['cancellation_reason' => $request->reason] : [];
+
+        try {
+            $intent = $this->stripeClient->paymentIntents->cancel($request->paymentId, $params);
+        } catch (InvalidRequestException $e) {
+            throw new PaymentNotFoundException($request->paymentId, $e);
+        }
+
+        return $this->hydratePayment($intent);
+    }
+
+    public function getPayment(GetPaymentRequest $request): Payment
+    {
+        try {
+            $intent = $this->stripeClient->paymentIntents->retrieve($request->paymentId);
+        } catch (InvalidRequestException $e) {
+            throw new PaymentNotFoundException($request->paymentId, $e);
+        }
+
+        return $this->hydratePayment($intent);
+    }
+
+    private function hydratePayment(PaymentIntent $intent): Payment
+    {
+        /** @psalm-suppress UndefinedMagicPropertyFetch */
+        $captured = (int) ($intent->amount_received ?? 0);
+
+        return new Payment(
+            $intent->id,
+            $this->mapPaymentStatus((string) $intent->status),
+            (int) $intent->amount,
+            (string) $intent->currency,
+            $captured,
+        );
+    }
+
+    private function mapPaymentStatus(string $stripeStatus): PaymentStatus
+    {
+        // Stripe spells it 'canceled'; the canonical status value is 'cancelled'.
+        return match ($stripeStatus) {
+            'canceled' => PaymentStatus::Cancelled,
+            default => PaymentStatus::tryFrom($stripeStatus) ?? PaymentStatus::Processing,
+        };
     }
 
     private function hydrateSubscription(\Stripe\Subscription $stripeSubscription): Subscription
