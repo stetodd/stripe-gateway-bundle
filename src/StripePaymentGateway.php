@@ -267,12 +267,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
 
     private function hydrateSubscription(\Stripe\Subscription $stripeSubscription): Subscription
     {
-        /** @psalm-suppress UndefinedMagicPropertyFetch */
-        $periodStart = new \DateTimeImmutable()
-            ->setTimestamp((int) $stripeSubscription->current_period_start);
-        /** @psalm-suppress UndefinedMagicPropertyFetch */
-        $periodEnd = new \DateTimeImmutable()
-            ->setTimestamp((int) $stripeSubscription->current_period_end);
+        [$periodStart, $periodEnd] = $this->currentPeriod($stripeSubscription);
 
         $cancelAtPeriodEnd = $stripeSubscription->cancel_at_period_end;
 
@@ -283,6 +278,40 @@ class StripePaymentGateway implements PaymentGatewayInterface
             $periodEnd,
             $cancelAtPeriodEnd
         );
+    }
+
+    /**
+     * Stripe API 2025-03-31 (basil) moved current_period_start/end off the
+     * subscription and onto each subscription item, so on current API versions
+     * the top-level fields are absent and read as epoch zero. Items win when
+     * present (the earliest start and latest end across them); the top-level
+     * fields remain the fallback for accounts pinned to an older version.
+     *
+     * @return array{\DateTimeImmutable, \DateTimeImmutable}
+     */
+    private function currentPeriod(\Stripe\Subscription $stripeSubscription): array
+    {
+        $start = null;
+        $end = null;
+
+        foreach ($stripeSubscription->items->data as $item) {
+            if (isset($item->current_period_start)) {
+                $start = min($start ?? \PHP_INT_MAX, (int) $item->current_period_start);
+            }
+            if (isset($item->current_period_end)) {
+                $end = max($end ?? 0, (int) $item->current_period_end);
+            }
+        }
+
+        /** @psalm-suppress UndefinedMagicPropertyFetch */
+        $start ??= isset($stripeSubscription->current_period_start) ? (int) $stripeSubscription->current_period_start : 0;
+        /** @psalm-suppress UndefinedMagicPropertyFetch */
+        $end ??= isset($stripeSubscription->current_period_end) ? (int) $stripeSubscription->current_period_end : 0;
+
+        return [
+            new \DateTimeImmutable()->setTimestamp($start),
+            new \DateTimeImmutable()->setTimestamp($end),
+        ];
     }
 
     private function mapStatus(string $stripeStatus): Status
