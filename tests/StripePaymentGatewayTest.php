@@ -16,7 +16,9 @@ use Stetodd\PaymentGateway\Model\Payment\RefundStatus;
 use Stetodd\PaymentGateway\Model\Request\Checkout\CreateCheckoutSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CreatePaymentHoldRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\RefundPaymentRequest;
+use Stetodd\PaymentGateway\Model\Request\Subscription\CancelSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\GetSubscriptionRequest;
+use Stetodd\PaymentGateway\Model\Subscription\Status;
 use Stetodd\StripeGatewayBundle\StripePaymentGateway;
 use Stripe\ApiRequestor;
 use Stripe\StripeClient;
@@ -127,6 +129,35 @@ final class StripePaymentGatewayTest extends TestCase
         $this->gateway->findLatestSubscriptionPayment(new GetSubscriptionRequest('sub_missing'));
     }
 
+    public function test_an_immediate_cancel_cancels_the_subscription_now(): void
+    {
+        $this->http->respond('delete', '/v1/subscriptions/sub_1', $this->subscription('canceled', false));
+
+        $subscription = $this->gateway->cancelSubscription(new CancelSubscriptionRequest('sub_1'));
+
+        self::assertSame(Status::Cancelled, $subscription->status);
+    }
+
+    public function test_a_cancel_at_period_end_only_flags_the_subscription(): void
+    {
+        $this->http->respond('post', '/v1/subscriptions/sub_1', $this->subscription('active', true));
+        $request = new CancelSubscriptionRequest('sub_1');
+        $request->cancelAtPeriodEnd();
+
+        $subscription = $this->gateway->cancelSubscription($request);
+
+        self::assertTrue($subscription->cancelAtPeriodEnd);
+        self::assertSame(['cancel_at_period_end' => 'true'], $this->http->lastParams(), 'stripe-php sends booleans as strings');
+    }
+
+    public function test_cancelling_a_missing_subscription_is_not_found(): void
+    {
+        $this->http->respondError('delete', '/v1/subscriptions/sub_missing', 404, 'resource_missing', "No such subscription: 'sub_missing'");
+
+        $this->expectException(SubscriptionNotFoundException::class);
+        $this->gateway->cancelSubscription(new CancelSubscriptionRequest('sub_missing'));
+    }
+
     public function test_custom_text_reaches_the_subscription_checkout(): void
     {
         $this->http->respond('post', '/v1/checkout/sessions', ['id' => 'cs_1', 'object' => 'checkout.session', 'url' => 'https://checkout.stripe.test/cs_1']);
@@ -159,5 +190,17 @@ final class StripePaymentGatewayTest extends TestCase
         ));
 
         self::assertArrayNotHasKey('custom_text', $this->http->lastParams());
+    }
+
+    /** @return array<string, mixed> */
+    private function subscription(string $status, bool $cancelAtPeriodEnd): array
+    {
+        return [
+            'id' => 'sub_1',
+            'object' => 'subscription',
+            'status' => $status,
+            'cancel_at_period_end' => $cancelAtPeriodEnd,
+            'items' => ['object' => 'list', 'data' => [['id' => 'si_1', 'object' => 'subscription_item', 'current_period_start' => 1_789_000_000, 'current_period_end' => 1_791_600_000]]],
+        ];
     }
 }

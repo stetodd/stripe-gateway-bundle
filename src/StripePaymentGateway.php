@@ -143,14 +143,25 @@ class StripePaymentGateway implements PaymentGatewayInterface
         );
     }
 
+    /**
+     * At period end, the subscription is flagged and runs out its paid period.
+     * Otherwise it is cancelled now: Stripe ends it at once, with no proration
+     * invoice, and sends customer.subscription.deleted. (Before v0.5.1 the
+     * immediate form only cleared cancel_at_period_end and cancelled nothing.)
+     */
     public function cancelSubscription(CancelSubscriptionRequest $request): Subscription
     {
-        $response = $this->stripeClient->subscriptions->update(
-            $request->subscriptionId,
-            [
-                'cancel_at_period_end' => $request->cancelAtPeriodEnd,
-            ]
-        );
+        try {
+            $response = $request->cancelAtPeriodEnd
+                ? $this->stripeClient->subscriptions->update($request->subscriptionId, ['cancel_at_period_end' => true])
+                : $this->stripeClient->subscriptions->cancel($request->subscriptionId);
+        } catch (InvalidRequestException $e) {
+            if ($e->getStripeCode() === 'resource_missing') {
+                throw new SubscriptionNotFoundException($request->subscriptionId, $e);
+            }
+
+            throw $e;
+        }
 
         return $this->hydrateSubscription($response);
     }
