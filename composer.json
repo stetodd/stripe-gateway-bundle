@@ -6,7 +6,7 @@
     "require": {
         "php": ">=8.4",
         "psr/log": "^3.0",
-        "stetodd/payment-gateway": "^0.4",
+        "stetodd/payment-gateway": "^0.5",
         "stripe/stripe-php": "^20.2",
         "symfony/config": "^7.2|^8.0",
         "symfony/dependency-injection": "^7.2|^8.0",
@@ -15,16 +15,27 @@
         "symfony/serializer": "^7.2|^8.0",
         "symfony/webhook": "^7.2|^8.0"
     },
+    "require-dev": {
+        "phpunit/phpunit": "^12.0"
+    },
     "autoload": {
         "psr-4": {
             "Stetodd\\StripeGatewayBundle\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Stetodd\\StripeGatewayBundle\\Tests\\": "tests/"
         }
     },
     "minimum-stability": "dev",
     "prefer-stable": true,
     "extra": {
         "branch-alias": {
-            "dev-main": "0.4.x-dev"
+            "dev-main": "0.5.x-dev"
         }
+    },
+    "scripts": {
+        "test": "phpunit"
     }
 }

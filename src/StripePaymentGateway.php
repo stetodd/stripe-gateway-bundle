@@ -6,18 +6,23 @@ namespace Stetodd\StripeGatewayBundle;
 
 use Psr\Log\LoggerInterface;
 use Stetodd\PaymentGateway\Exception\Payment\PaymentNotFoundException;
+use Stetodd\PaymentGateway\Exception\Payment\RefundFailedException;
 use Stetodd\PaymentGateway\Exception\Subscription\SubscriptionNotFoundException;
+use Stetodd\PaymentGateway\Model\Checkout\CustomText;
 use Stetodd\PaymentGateway\Model\Checkout\LineItem;
 use Stetodd\PaymentGateway\Model\Checkout\Session;
 use Stetodd\PaymentGateway\Model\Customer;
 use Stetodd\PaymentGateway\Model\Payment\Payment;
 use Stetodd\PaymentGateway\Model\Payment\PaymentStatus;
+use Stetodd\PaymentGateway\Model\Payment\Refund;
+use Stetodd\PaymentGateway\Model\Payment\RefundStatus;
 use Stetodd\PaymentGateway\Model\Request\Checkout\CreateCheckoutSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Customer\CreateCustomerRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CancelPaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CapturePaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CreatePaymentHoldRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\GetPaymentRequest;
+use Stetodd\PaymentGateway\Model\Request\Payment\RefundPaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Portal\CreatePortalSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\CancelSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\GetSubscriptionRequest;
@@ -26,8 +31,11 @@ use Stetodd\PaymentGateway\Model\Request\Subscription\UpdateSubscriptionPlanRequ
 use Stetodd\PaymentGateway\Model\Request\Subscription\UpdateSubscriptionQuantityRequest;
 use Stetodd\PaymentGateway\Model\Subscription;
 use Stetodd\PaymentGateway\Model\Subscription\Status;
+use Stetodd\PaymentGateway\Model\Subscription\SubscriptionPayment;
 use Stetodd\PaymentGateway\PaymentGatewayInterface;
+use Stripe\Exception\CardException;
 use Stripe\Exception\InvalidRequestException;
+use Stripe\Invoice;
 use Stripe\PaymentIntent;
 use Stripe\StripeClient;
 
@@ -55,7 +63,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
             'success_url' => $request->successUrl.(str_contains($request->successUrl, '?') ? '&' : '?').'session_id={CHECKOUT_SESSION_ID}',
             'cancel_url' => $request->cancelUrl,
             'metadata' => $request->getMetadata(),
-        ]);
+        ] + $this->customTextParams($request->customText));
 
         $url = $session->url;
         if ($url === null) {
@@ -90,6 +98,49 @@ class StripePaymentGateway implements PaymentGatewayInterface
         } catch (SubscriptionNotFoundException) {
             return null;
         }
+    }
+
+    /**
+     * Stripe API basil moved the payment off the invoice (`payment_intent`)
+     * and onto invoice payments, so the paid invoice is found first and its
+     * payment second. An invoice settled entirely from credit balance has no
+     * payment to refund and reads as nothing paid.
+     */
+    public function findLatestSubscriptionPayment(GetSubscriptionRequest $request): ?SubscriptionPayment
+    {
+        try {
+            $invoices = $this->stripeClient->invoices->all([
+                'subscription' => $request->subscriptionId,
+                'status' => 'paid',
+                'limit' => 1,
+            ]);
+        } catch (InvalidRequestException $e) {
+            throw new SubscriptionNotFoundException($request->subscriptionId, $e);
+        }
+
+        $invoice = $invoices->data[0] ?? null;
+        if (!$invoice instanceof Invoice || $invoice->amount_paid < 1) {
+            return null;
+        }
+
+        $paymentId = $this->paymentIdForInvoice($invoice->id);
+        if ($paymentId === null) {
+            return null;
+        }
+
+        [$periodStart, $periodEnd] = $this->servicePeriod($invoice);
+        $paidAt = $invoice->status_transitions->paid_at ?? $invoice->created;
+
+        return new SubscriptionPayment(
+            $request->subscriptionId,
+            $invoice->id,
+            $paymentId,
+            $invoice->amount_paid,
+            $invoice->currency,
+            new \DateTimeImmutable()->setTimestamp($paidAt),
+            $periodStart,
+            $periodEnd,
+        );
     }
 
     public function cancelSubscription(CancelSubscriptionRequest $request): Subscription
@@ -188,7 +239,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
             'success_url' => $request->successUrl.(str_contains($request->successUrl, '?') ? '&' : '?').'session_id={CHECKOUT_SESSION_ID}',
             'cancel_url' => $request->cancelUrl,
             'metadata' => $request->getMetadata(),
-        ]);
+        ] + $this->customTextParams($request->customText));
 
         $url = $session->url;
         if ($url === null) {
@@ -240,6 +291,117 @@ class StripePaymentGateway implements PaymentGatewayInterface
         }
 
         return $this->hydratePayment($intent);
+    }
+
+    /**
+     * Refunds against the PaymentIntent, or against the charge when the id is
+     * one (older invoices paid without an intent). A refusal Stripe reports
+     * up front — more than is left, a disputed charge, nothing captured — is
+     * a RefundFailedException; transport errors propagate so callers can retry.
+     */
+    public function refundPayment(RefundPaymentRequest $request): Refund
+    {
+        $params = [
+            str_starts_with($request->paymentId, 'ch_') ? 'charge' : 'payment_intent' => $request->paymentId,
+            'metadata' => $request->metadata,
+        ];
+        if ($request->amount !== null) {
+            $params['amount'] = $request->amount;
+        }
+
+        try {
+            $refund = $this->stripeClient->refunds->create($params);
+        } catch (InvalidRequestException $e) {
+            if ($e->getStripeCode() === 'resource_missing') {
+                throw new PaymentNotFoundException($request->paymentId, $e);
+            }
+
+            throw new RefundFailedException($request->paymentId, $e->getMessage(), $e);
+        } catch (CardException $e) {
+            throw new RefundFailedException($request->paymentId, $e->getMessage(), $e);
+        }
+
+        return new Refund(
+            $refund->id,
+            $request->paymentId,
+            $this->mapRefundStatus((string) $refund->status),
+            $refund->amount,
+            $refund->currency,
+            isset($refund->failure_reason) ? (string) $refund->failure_reason : null,
+        );
+    }
+
+    /**
+     * @return array{custom_text?: array<string, array{message: string}>}
+     */
+    private function customTextParams(?CustomText $customText): array
+    {
+        $params = array_filter([
+            'submit' => $customText?->submit,
+            'after_submit' => $customText?->afterSubmit,
+        ], static fn (?string $message): bool => $message !== null && $message !== '');
+
+        if ($params === []) {
+            return [];
+        }
+
+        return ['custom_text' => array_map(static fn (string $message): array => ['message' => $message], $params)];
+    }
+
+    private function paymentIdForInvoice(string $invoiceId): ?string
+    {
+        $payments = $this->stripeClient->invoicePayments->all(['invoice' => $invoiceId, 'status' => 'paid']);
+
+        foreach ($payments->data as $invoicePayment) {
+            $payment = $invoicePayment->payment;
+            foreach ([$payment->payment_intent ?? null, $payment->charge ?? null] as $reference) {
+                if (\is_string($reference)) {
+                    return $reference;
+                }
+                if (\is_object($reference) && isset($reference->id) && \is_string($reference->id)) {
+                    return $reference->id;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * The service period the invoice bought: the span of its subscription
+     * item lines (earliest start, latest end), falling back to every line.
+     *
+     * @return array{\DateTimeImmutable, \DateTimeImmutable}
+     */
+    private function servicePeriod(Invoice $invoice): array
+    {
+        $all = [];
+        $items = [];
+        foreach ($invoice->lines->data as $line) {
+            $span = [(int) $line->period->start, (int) $line->period->end];
+            $all[] = $span;
+            if (($line->parent->type ?? null) === 'subscription_item_details') {
+                $items[] = $span;
+            }
+        }
+        $spans = $items !== [] ? $items : $all;
+
+        $start = $spans === [] ? $invoice->period_start : min(array_column($spans, 0));
+        $end = $spans === [] ? $invoice->period_end : max(array_column($spans, 1));
+
+        return [
+            new \DateTimeImmutable()->setTimestamp($start),
+            new \DateTimeImmutable()->setTimestamp($end),
+        ];
+    }
+
+    private function mapRefundStatus(string $stripeStatus): RefundStatus
+    {
+        // Stripe spells it 'canceled'; the canonical status value is 'cancelled'.
+        return match ($stripeStatus) {
+            'canceled' => RefundStatus::Cancelled,
+            default => RefundStatus::tryFrom($stripeStatus) ?? RefundStatus::Pending,
+        };
     }
 
     private function hydratePayment(PaymentIntent $intent): Payment

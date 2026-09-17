@@ -54,3 +54,13 @@ Consume events with a `#[AsRemoteEventConsumer('stripe')]` consumer in your app 
 ## One-off holds (v0.4)
 
 `createPaymentHoldSession()` opens a Checkout Session in `payment` mode with `payment_intent_data[capture_method]=manual`, so the amount is authorised but not captured. The `checkout.session.completed` webhook's session carries the `payment_intent` id; capture it with `capturePayment()` on fulfilment or release it with `cancelPayment()`. Card authorisations last seven days.
+
+## Refunds and checkout text (v0.5)
+
+`refundPayment()` refunds a captured payment, all of it or a partial amount in minor units. Repeated partial refunds are allowed up to the amount captured. It refunds against the PaymentIntent (`pi_…`), or against the charge when given a `ch_…` id. If Stripe refuses up front (more than is left, a disputed or already-refunded charge), it throws `RefundFailedException`. A missing payment throws `PaymentNotFoundException`. Network errors propagate. A refund Stripe accepts can still fail later (`charge.refund.updated`), so read `Refund::$status`.
+
+`findLatestSubscriptionPayment()` returns the subscription's most recent paid invoice as a `SubscriptionPayment`: the payment id to refund, amount paid, when it was paid, and the service period it bought. On Stripe API basil and later, the payment lives on invoice payments rather than `invoice.payment_intent`, so this makes two calls. An invoice paid entirely from credit balance returns `null`, because there's nothing to refund.
+
+`CreateCheckoutSessionRequest` and `CreatePaymentHoldRequest` take an optional `CustomText` (`submit`, `afterSubmit`), sent as Checkout's `custom_text`.
+
+Tests: `composer install && vendor/bin/phpunit`. Stripe is faked at the HTTP client, and nothing leaves the machine.
