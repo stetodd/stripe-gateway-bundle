@@ -8,6 +8,7 @@ use Psr\Log\LoggerInterface;
 use Stetodd\PaymentGateway\Exception\Payment\PaymentNotFoundException;
 use Stetodd\PaymentGateway\Exception\Payment\RefundFailedException;
 use Stetodd\PaymentGateway\Exception\Subscription\SubscriptionNotFoundException;
+use Stetodd\PaymentGateway\Model\Checkout\CheckoutMode;
 use Stetodd\PaymentGateway\Model\Checkout\CheckoutSession;
 use Stetodd\PaymentGateway\Model\Checkout\CheckoutStatus;
 use Stetodd\PaymentGateway\Model\Checkout\CustomText;
@@ -59,14 +60,19 @@ class StripePaymentGateway implements PaymentGatewayInterface
             ],
             $request->lineItems->getItems()
         );
+        $payment = $request->mode === CheckoutMode::Payment;
         $session = $this->stripeClient->checkout->sessions->create([
             'customer' => $request->customer->id,
-            'mode' => 'subscription',
+            'mode' => $request->mode->value,
             'line_items' => $lineItems,
             'success_url' => $request->successUrl.(str_contains($request->successUrl, '?') ? '&' : '?').'session_id={CHECKOUT_SESSION_ID}',
             'cancel_url' => $request->cancelUrl,
             'metadata' => $request->getMetadata(),
-        ] + $this->customTextParams($request->customText));
+        ]
+            // In payment mode the charge is its own object, so the metadata has
+            // to be put on it too or a refund months later has nothing to read.
+            + ($payment ? ['payment_intent_data' => ['metadata' => $request->getMetadata()]] : [])
+            + $this->customTextParams($request->customText));
 
         $url = $session->url;
         if ($url === null) {
@@ -112,6 +118,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
             self::idOf($data['customer'] ?? null),
             (int) ($data['amount_total'] ?? 0),
             $metadata,
+            self::idOf($data['payment_intent'] ?? null),
         );
     }
 

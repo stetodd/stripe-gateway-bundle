@@ -9,6 +9,7 @@ use Stetodd\PaymentGateway\Exception\Payment\PaymentNotFoundException;
 use Stetodd\PaymentGateway\Exception\Payment\RefundFailedException;
 use Stetodd\PaymentGateway\Exception\Subscription\SubscriptionNotFoundException;
 use Stetodd\PaymentGateway\Model\Checkout\CheckoutStatus;
+use Stetodd\PaymentGateway\Model\Checkout\CheckoutMode;
 use Stetodd\PaymentGateway\Model\Checkout\CustomText;
 use Stetodd\PaymentGateway\Model\Checkout\LineItem;
 use Stetodd\PaymentGateway\Model\Checkout\LineItemCollection;
@@ -220,6 +221,49 @@ final class StripePaymentGatewayTest extends TestCase
         ));
 
         self::assertSame(['submit' => ['message' => 'You can cancel within 14 days.']], $this->http->lastParams()['custom_text'] ?? null);
+    }
+
+    public function test_a_one_off_checkout_goes_up_in_payment_mode_and_marks_the_charge(): void
+    {
+        $this->http->respond('post', '/v1/checkout/sessions', ['id' => 'cs_2', 'object' => 'checkout.session', 'url' => 'https://checkout.stripe.test/cs_2']);
+        $lineItems = new LineItemCollection();
+        $lineItems->add(LineItem::fromPriceId('price_pass', 1));
+
+        $this->gateway->createCheckoutSession(new CreateCheckoutSessionRequest(
+            new Customer('cus_1', []),
+            $lineItems,
+            'https://app.test/ok',
+            'https://app.test/cancel',
+            ['term' => 'move_pass'],
+            null,
+            CheckoutMode::Payment,
+        ));
+
+        $params = $this->http->lastParams();
+        self::assertSame('payment', $params['mode'] ?? null);
+        // The charge outlives the session, and a refund months later reads it.
+        self::assertSame(['term' => 'move_pass'], $params['payment_intent_data']['metadata'] ?? null);
+    }
+
+    public function test_a_one_off_checkout_reads_back_with_the_payment_to_refund(): void
+    {
+        $this->http->respond('get', '/v1/checkout/sessions/cs_2', [
+            'id' => 'cs_2',
+            'object' => 'checkout.session',
+            'status' => 'complete',
+            'payment_status' => 'paid',
+            'payment_intent' => 'pi_2',
+            'customer' => 'cus_1',
+            'amount_total' => 4900,
+            'metadata' => ['term' => 'move_pass'],
+        ]);
+
+        $session = $this->gateway->findCheckoutSession(new GetCheckoutSessionRequest('cs_2'));
+
+        self::assertNotNull($session);
+        self::assertNull($session->subscriptionId);
+        self::assertSame('pi_2', $session->paymentIntentId);
+        self::assertSame(4900, $session->amountTotal);
     }
 
     public function test_a_paid_checkout_reads_back_with_its_subscription_and_metadata(): void
