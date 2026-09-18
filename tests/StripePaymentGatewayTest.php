@@ -18,6 +18,7 @@ use Stetodd\PaymentGateway\Model\Request\Payment\CreatePaymentHoldRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\RefundPaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\CancelSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\GetSubscriptionRequest;
+use Stetodd\PaymentGateway\Model\Request\Subscription\ReactivateSubscriptionRequest;
 use Stetodd\PaymentGateway\Model\Subscription\Status;
 use Stetodd\StripeGatewayBundle\StripePaymentGateway;
 use Stripe\ApiRequestor;
@@ -150,6 +151,49 @@ final class StripePaymentGatewayTest extends TestCase
         self::assertSame(['cancel_at_period_end' => 'true'], $this->http->lastParams(), 'stripe-php sends booleans as strings');
     }
 
+    public function test_a_subscription_cancelled_in_the_portal_reads_as_ending(): void
+    {
+        // The portal names the moment instead of setting the flag.
+        $this->http->respond('get', '/v1/subscriptions/sub_1', $this->subscription('active', false, 1_791_600_000));
+
+        $subscription = $this->gateway->getSubscription(new GetSubscriptionRequest('sub_1'));
+
+        self::assertTrue($subscription->cancelAtPeriodEnd);
+        self::assertEquals(new \DateTimeImmutable()->setTimestamp(1_791_600_000), $subscription->cancelAt);
+    }
+
+    public function test_a_subscription_with_neither_flag_nor_date_renews(): void
+    {
+        $this->http->respond('get', '/v1/subscriptions/sub_1', $this->subscription('active', false));
+
+        $subscription = $this->gateway->getSubscription(new GetSubscriptionRequest('sub_1'));
+
+        self::assertFalse($subscription->cancelAtPeriodEnd);
+        self::assertNull($subscription->cancelAt);
+    }
+
+    public function test_reactivating_clears_the_named_cancellation_date(): void
+    {
+        $this->http->respond('get', '/v1/subscriptions/sub_1', $this->subscription('active', false, 1_791_600_000));
+        $this->http->respond('post', '/v1/subscriptions/sub_1', $this->subscription('active', false));
+
+        $this->gateway->reactivateSubscription(new ReactivateSubscriptionRequest('sub_1'));
+
+        // Stripe refuses cancel_at alongside cancel_at_period_end, and takes an
+        // empty string as the null that unsets the field.
+        self::assertSame(['cancel_at' => ''], $this->http->params('post', '/v1/subscriptions/sub_1'));
+    }
+
+    public function test_reactivating_a_subscription_cancelled_by_the_flag_clears_the_flag(): void
+    {
+        $this->http->respond('get', '/v1/subscriptions/sub_1', $this->subscription('active', true));
+        $this->http->respond('post', '/v1/subscriptions/sub_1', $this->subscription('active', false));
+
+        $this->gateway->reactivateSubscription(new ReactivateSubscriptionRequest('sub_1'));
+
+        self::assertSame(['cancel_at_period_end' => 'false'], $this->http->params('post', '/v1/subscriptions/sub_1'));
+    }
+
     public function test_cancelling_a_missing_subscription_is_not_found(): void
     {
         $this->http->respondError('delete', '/v1/subscriptions/sub_missing', 404, 'resource_missing', "No such subscription: 'sub_missing'");
@@ -193,13 +237,14 @@ final class StripePaymentGatewayTest extends TestCase
     }
 
     /** @return array<string, mixed> */
-    private function subscription(string $status, bool $cancelAtPeriodEnd): array
+    private function subscription(string $status, bool $cancelAtPeriodEnd, ?int $cancelAt = null): array
     {
         return [
             'id' => 'sub_1',
             'object' => 'subscription',
             'status' => $status,
             'cancel_at_period_end' => $cancelAtPeriodEnd,
+            'cancel_at' => $cancelAt,
             'items' => ['object' => 'list', 'data' => [['id' => 'si_1', 'object' => 'subscription_item', 'current_period_start' => 1_789_000_000, 'current_period_end' => 1_791_600_000]]],
         ];
     }

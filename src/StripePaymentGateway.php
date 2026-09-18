@@ -168,23 +168,37 @@ class StripePaymentGateway implements PaymentGatewayInterface
 
     public function reactivateSubscription(ReactivateSubscriptionRequest $request): void
     {
-        $this->stripeClient->subscriptions->update($request->subscriptionId, [
-            'cancel_at_period_end' => false,
-        ]);
+        $this->stripeClient->subscriptions->update($request->subscriptionId, $this->uncancel($request->subscriptionId));
     }
 
     public function updateSubscriptionPlan(UpdateSubscriptionPlanRequest $request): void
     {
-        /** @psalm-suppress UndefinedMagicPropertyFetch, MixedPropertyFetch */
-        $items = $this->stripeClient->subscriptions->retrieve($request->subscriptionId)->items;
+        $subscription = $this->stripeClient->subscriptions->retrieve($request->subscriptionId);
         /** @psalm-suppress MixedPropertyFetch, MixedArrayAccess */
-        $itemId = $items->data[0]->id;
+        $itemId = $subscription->items->data[0]->id;
 
         $this->stripeClient->subscriptions->update($request->subscriptionId, [
             'items' => [['id' => $itemId, 'price' => $request->newPriceId]],
             'proration_behavior' => 'create_prorations',
-            'cancel_at_period_end' => false,
+            ...$this->uncancel($subscription),
         ]);
+    }
+
+    /**
+     * The parameters that undo a pending cancellation. Stripe refuses both at
+     * once ("pass in only one"), and each undoes only its own form: a portal
+     * cancellation names a moment in cancel_at, ours sets the flag. Clearing
+     * cancel_at clears the flag along with it, so the date wins when set.
+     *
+     * @return array{cancel_at: null}|array{cancel_at_period_end: false}
+     */
+    private function uncancel(string|\Stripe\Subscription $subscription): array
+    {
+        if (is_string($subscription)) {
+            $subscription = $this->stripeClient->subscriptions->retrieve($subscription);
+        }
+
+        return $subscription->cancel_at !== null ? ['cancel_at' => null] : ['cancel_at_period_end' => false];
     }
 
     public function updateSubscriptionQuantity(UpdateSubscriptionQuantityRequest $request): void
@@ -438,18 +452,25 @@ class StripePaymentGateway implements PaymentGatewayInterface
         };
     }
 
+    /**
+     * A subscription told to stop is not always flagged. Cancelling through the
+     * customer portal names the moment instead — `cancel_at` is set and
+     * `cancel_at_period_end` stays false — so either one means it will not renew.
+     */
     private function hydrateSubscription(\Stripe\Subscription $stripeSubscription): Subscription
     {
         [$periodStart, $periodEnd] = $this->currentPeriod($stripeSubscription);
 
-        $cancelAtPeriodEnd = $stripeSubscription->cancel_at_period_end;
+        $cancelAt = $stripeSubscription->cancel_at;
+        $cancelAt = $cancelAt === null ? null : new \DateTimeImmutable()->setTimestamp((int) $cancelAt);
 
         return new Subscription(
             $stripeSubscription->id,
             $this->mapStatus($stripeSubscription->status),
             $periodStart,
             $periodEnd,
-            $cancelAtPeriodEnd
+            $stripeSubscription->cancel_at_period_end || $cancelAt !== null,
+            $cancelAt,
         );
     }
 
