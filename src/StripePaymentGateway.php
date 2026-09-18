@@ -8,6 +8,8 @@ use Psr\Log\LoggerInterface;
 use Stetodd\PaymentGateway\Exception\Payment\PaymentNotFoundException;
 use Stetodd\PaymentGateway\Exception\Payment\RefundFailedException;
 use Stetodd\PaymentGateway\Exception\Subscription\SubscriptionNotFoundException;
+use Stetodd\PaymentGateway\Model\Checkout\CheckoutSession;
+use Stetodd\PaymentGateway\Model\Checkout\CheckoutStatus;
 use Stetodd\PaymentGateway\Model\Checkout\CustomText;
 use Stetodd\PaymentGateway\Model\Checkout\LineItem;
 use Stetodd\PaymentGateway\Model\Checkout\Session;
@@ -17,6 +19,7 @@ use Stetodd\PaymentGateway\Model\Payment\PaymentStatus;
 use Stetodd\PaymentGateway\Model\Payment\Refund;
 use Stetodd\PaymentGateway\Model\Payment\RefundStatus;
 use Stetodd\PaymentGateway\Model\Request\Checkout\CreateCheckoutSessionRequest;
+use Stetodd\PaymentGateway\Model\Request\Checkout\GetCheckoutSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Customer\CreateCustomerRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CancelPaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CapturePaymentRequest;
@@ -77,7 +80,68 @@ class StripePaymentGateway implements PaymentGatewayInterface
             throw new \RuntimeException(sprintf('Stripe Checkout session URL is null for %s and plan %s', $request->customer->id, implode(',', array_map(fn (LineItem $item) => $item->getPriceId(), $request->lineItems->getItems()))));
         }
 
-        return new Session($url);
+        return new Session($session->id, $url);
+    }
+
+    public function findCheckoutSession(GetCheckoutSessionRequest $request): ?CheckoutSession
+    {
+        try {
+            $session = $this->stripeClient->checkout->sessions->retrieve($request->sessionId);
+        } catch (InvalidRequestException $e) {
+            if ($e->getStripeCode() === 'resource_missing') {
+                return null;
+            }
+
+            throw $e;
+        }
+
+        // Read through the array form: a session Stripe left a field off
+        // altogether is ordinary, and reading it off the object warns.
+        $data = $session->toArray();
+
+        /** @var array<string, string> $metadata */
+        $metadata = $data['metadata'] ?? [];
+
+        return new CheckoutSession(
+            $session->id,
+            CheckoutStatus::tryFrom((string) ($data['status'] ?? '')) ?? CheckoutStatus::Open,
+            // A checkout that needed no payment (a full discount, say) is as
+            // settled as one that was paid.
+            in_array($data['payment_status'] ?? null, ['paid', 'no_payment_required'], true),
+            self::idOf($data['subscription'] ?? null),
+            self::idOf($data['customer'] ?? null),
+            (int) ($data['amount_total'] ?? 0),
+            $metadata,
+        );
+    }
+
+    /**
+     * Stripe refuses to expire a session that is no longer open, which is the
+     * outcome asked for, so that refusal is not an error here.
+     */
+    public function expireCheckoutSession(GetCheckoutSessionRequest $request): void
+    {
+        try {
+            $this->stripeClient->checkout->sessions->expire($request->sessionId);
+        } catch (InvalidRequestException $e) {
+            if ($e->getStripeCode() === 'resource_missing' || $e->getHttpStatus() === 400) {
+                return;
+            }
+
+            throw $e;
+        }
+    }
+
+    /** A related object comes back either as a bare id or expanded. */
+    private static function idOf(mixed $related): ?string
+    {
+        if (is_string($related)) {
+            return $related;
+        }
+
+        $id = $related instanceof \Stripe\StripeObject ? $related->id : null;
+
+        return is_string($id) ? $id : null;
     }
 
     public function getSubscription(GetSubscriptionRequest $request): Subscription
@@ -278,7 +342,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
             throw new \RuntimeException(sprintf('Stripe Checkout hold session URL is null for %s', $request->customer->id));
         }
 
-        return new Session($url);
+        return new Session($session->id, $url);
     }
 
     public function capturePayment(CapturePaymentRequest $request): Payment

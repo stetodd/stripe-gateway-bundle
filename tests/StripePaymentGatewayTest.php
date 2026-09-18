@@ -8,12 +8,14 @@ use PHPUnit\Framework\TestCase;
 use Stetodd\PaymentGateway\Exception\Payment\PaymentNotFoundException;
 use Stetodd\PaymentGateway\Exception\Payment\RefundFailedException;
 use Stetodd\PaymentGateway\Exception\Subscription\SubscriptionNotFoundException;
+use Stetodd\PaymentGateway\Model\Checkout\CheckoutStatus;
 use Stetodd\PaymentGateway\Model\Checkout\CustomText;
 use Stetodd\PaymentGateway\Model\Checkout\LineItem;
 use Stetodd\PaymentGateway\Model\Checkout\LineItemCollection;
 use Stetodd\PaymentGateway\Model\Customer;
 use Stetodd\PaymentGateway\Model\Payment\RefundStatus;
 use Stetodd\PaymentGateway\Model\Request\Checkout\CreateCheckoutSessionRequest;
+use Stetodd\PaymentGateway\Model\Request\Checkout\GetCheckoutSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CreatePaymentHoldRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\RefundPaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Subscription\CancelSubscriptionRequest;
@@ -218,6 +220,70 @@ final class StripePaymentGatewayTest extends TestCase
         ));
 
         self::assertSame(['submit' => ['message' => 'You can cancel within 14 days.']], $this->http->lastParams()['custom_text'] ?? null);
+    }
+
+    public function test_a_paid_checkout_reads_back_with_its_subscription_and_metadata(): void
+    {
+        $this->http->respond('get', '/v1/checkout/sessions/cs_1', [
+            'id' => 'cs_1',
+            'object' => 'checkout.session',
+            'status' => 'complete',
+            'payment_status' => 'paid',
+            'subscription' => 'sub_1',
+            'customer' => 'cus_1',
+            'amount_total' => 4900,
+            'metadata' => ['plan' => 'mover'],
+        ]);
+
+        $session = $this->gateway->findCheckoutSession(new GetCheckoutSessionRequest('cs_1'));
+
+        self::assertNotNull($session);
+        self::assertSame(CheckoutStatus::Complete, $session->status);
+        self::assertTrue($session->paid);
+        self::assertSame('sub_1', $session->subscriptionId);
+        self::assertSame('cus_1', $session->customerId);
+        self::assertSame(4900, $session->amountTotal);
+        self::assertSame(['plan' => 'mover'], $session->metadata);
+    }
+
+    public function test_an_abandoned_checkout_reads_back_expired_and_unpaid(): void
+    {
+        $this->http->respond('get', '/v1/checkout/sessions/cs_1', [
+            'id' => 'cs_1',
+            'object' => 'checkout.session',
+            'status' => 'expired',
+            'payment_status' => 'unpaid',
+        ]);
+
+        $session = $this->gateway->findCheckoutSession(new GetCheckoutSessionRequest('cs_1'));
+
+        self::assertNotNull($session);
+        self::assertSame(CheckoutStatus::Expired, $session->status);
+        self::assertFalse($session->paid);
+        self::assertNull($session->subscriptionId);
+    }
+
+    public function test_a_checkout_that_needed_no_payment_counts_as_settled(): void
+    {
+        $this->http->respond('get', '/v1/checkout/sessions/cs_1', [
+            'id' => 'cs_1',
+            'object' => 'checkout.session',
+            'status' => 'complete',
+            'payment_status' => 'no_payment_required',
+            'subscription' => 'sub_1',
+        ]);
+
+        $session = $this->gateway->findCheckoutSession(new GetCheckoutSessionRequest('cs_1'));
+
+        self::assertNotNull($session);
+        self::assertTrue($session->paid);
+    }
+
+    public function test_a_checkout_stripe_has_never_heard_of_is_not_found(): void
+    {
+        $this->http->respondError('get', '/v1/checkout/sessions/cs_missing', 404, 'resource_missing', "No such checkout.session: 'cs_missing'");
+
+        self::assertNull($this->gateway->findCheckoutSession(new GetCheckoutSessionRequest('cs_missing')));
     }
 
     public function test_a_hold_checkout_without_custom_text_sends_none(): void
