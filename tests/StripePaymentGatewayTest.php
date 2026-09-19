@@ -57,6 +57,33 @@ final class StripePaymentGatewayTest extends TestCase
         self::assertSame(['payment_intent' => 'pi_1', 'metadata' => ['reason' => 'statutory'], 'amount' => 1000], $this->http->lastParams());
     }
 
+    public function test_a_keyed_refund_carries_its_key_on_the_refund_and_the_request(): void
+    {
+        $this->http->respond('get', '/v1/refunds', ['object' => 'list', 'data' => [], 'has_more' => false, 'url' => '/v1/refunds']);
+        $this->http->respond('post', '/v1/refunds', ['id' => 're_1', 'object' => 'refund', 'status' => 'succeeded', 'amount' => 1000, 'currency' => 'gbp']);
+
+        $this->gateway->refundPayment(new RefundPaymentRequest('pi_1', 1000, ['kind' => 'statutory'], 'statutory-abc'));
+
+        self::assertSame('pi_1', $this->http->params('get', '/v1/refunds')['payment_intent']);
+        self::assertSame(['kind' => 'statutory', 'idempotency_key' => 'statutory-abc'], $this->http->params('post', '/v1/refunds')['metadata']);
+        self::assertContains('Idempotency-Key: statutory-abc', $this->http->headers('post', '/v1/refunds'));
+    }
+
+    public function test_a_keyed_refund_already_made_is_returned_without_paying_again(): void
+    {
+        $this->http->respond('get', '/v1/refunds', ['object' => 'list', 'has_more' => false, 'url' => '/v1/refunds', 'data' => [
+            ['id' => 're_other', 'object' => 'refund', 'status' => 'succeeded', 'amount' => 200, 'currency' => 'gbp', 'metadata' => ['kind' => 'goodwill']],
+            ['id' => 're_failed', 'object' => 'refund', 'status' => 'failed', 'amount' => 1000, 'currency' => 'gbp', 'metadata' => ['idempotency_key' => 'statutory-abc']],
+            ['id' => 're_first', 'object' => 'refund', 'status' => 'succeeded', 'amount' => 1000, 'currency' => 'gbp', 'metadata' => ['idempotency_key' => 'statutory-abc']],
+        ]]);
+
+        $refund = $this->gateway->refundPayment(new RefundPaymentRequest('pi_1', 900, [], 'statutory-abc'));
+
+        self::assertSame('re_first', $refund->id);
+        self::assertSame(1000, $refund->amount);
+        self::assertSame(['get /v1/refunds'], $this->http->requests());
+    }
+
     public function test_a_charge_id_is_refunded_as_a_charge_and_a_full_refund_sends_no_amount(): void
     {
         $this->http->respond('post', '/v1/refunds', ['id' => 're_2', 'object' => 'refund', 'status' => 'pending', 'amount' => 1500, 'currency' => 'gbp']);

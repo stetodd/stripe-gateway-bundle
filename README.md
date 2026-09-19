@@ -59,6 +59,8 @@ Consume events with a `#[AsRemoteEventConsumer('stripe')]` consumer in your app 
 
 `refundPayment()` refunds a captured payment, all of it or a partial amount in minor units. Repeated partial refunds are allowed up to the amount captured. It refunds against the PaymentIntent (`pi_…`), or against the charge when given a `ch_…` id. If Stripe refuses up front (more than is left, a disputed or already-refunded charge), it throws `RefundFailedException`. A missing payment throws `PaymentNotFoundException`. Network errors propagate. A refund Stripe accepts can still fail later (`charge.refund.updated`), so read `Refund::$status`.
 
+Give the request an `idempotencyKey` and it pays at most once (v0.7.2). The key is written into the refund's metadata as `idempotency_key`. Before creating anything, the gateway lists the payment's refunds and returns a pending or succeeded one that carries the key, with that refund's amount. The key is also sent as Stripe's `Idempotency-Key` header, which only helps two requests racing each other, because Stripe forgets it after 24 hours.
+
 `findLatestSubscriptionPayment()` returns the subscription's most recent paid invoice as a `SubscriptionPayment`: the payment id to refund, amount paid, when it was paid, and the service period it bought. On Stripe API basil and later, the payment lives on invoice payments rather than `invoice.payment_intent`, so this makes two calls. An invoice paid entirely from credit balance returns `null`, because there's nothing to refund.
 
 `CreateCheckoutSessionRequest` and `CreatePaymentHoldRequest` take an optional `CustomText` (`submit`, `afterSubmit`), sent as Checkout's `custom_text`.

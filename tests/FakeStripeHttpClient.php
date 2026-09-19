@@ -18,6 +18,12 @@ final class FakeStripeHttpClient implements ClientInterface
     /** @var array<string, array<array-key, mixed>> */
     private array $params = [];
 
+    /** @var array<string, list<string>> */
+    private array $headers = [];
+
+    /** @var list<string> every request made, as "method path", oldest first */
+    private array $requests = [];
+
     private ?string $lastKey = null;
 
     /** @param array<string, mixed> $body */
@@ -43,15 +49,29 @@ final class FakeStripeHttpClient implements ClientInterface
         return $this->params[$method.' '.$path] ?? [];
     }
 
+    /** @return list<string> */
+    public function headers(string $method, string $path): array
+    {
+        return $this->headers[$method.' '.$path] ?? [];
+    }
+
+    /** @return list<string> */
+    public function requests(): array
+    {
+        return $this->requests;
+    }
+
     public function request($method, $absUrl, $headers, $params, $hasFile, $apiMode = 'v1', $maxNetworkRetries = null)
     {
         $path = (string) parse_url($absUrl, \PHP_URL_PATH);
         $key = $method.' '.$path;
+        $this->requests[] = $key;
         if (!isset($this->responses[$key])) {
             throw new \LogicException(sprintf('No canned Stripe response for %s', $key));
         }
 
         $this->params[$key] = $params;
+        $this->headers[$key] = array_values($headers);
         $this->lastKey = $key;
         [$status, $body] = $this->responses[$key];
 

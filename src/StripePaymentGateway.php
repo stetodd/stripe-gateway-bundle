@@ -38,6 +38,7 @@ use Stetodd\PaymentGateway\Model\Subscription\Status;
 use Stetodd\PaymentGateway\Model\Subscription\SubscriptionPayment;
 use Stetodd\PaymentGateway\PaymentGatewayInterface;
 use Stripe\Exception\CardException;
+use Stripe\Exception\IdempotencyException;
 use Stripe\Exception\InvalidRequestException;
 use Stripe\Invoice;
 use Stripe\PaymentIntent;
@@ -45,6 +46,9 @@ use Stripe\StripeClient;
 
 class StripePaymentGateway implements PaymentGatewayInterface
 {
+    /** Refund metadata key carrying the caller's idempotency key. */
+    private const string REFUND_KEY = 'idempotency_key';
+
     public function __construct(
         private StripeClient $stripeClient,
         private ?LoggerInterface $logger = null,
@@ -405,8 +409,25 @@ class StripePaymentGateway implements PaymentGatewayInterface
             $params['amount'] = $request->amount;
         }
 
+        $opts = [];
+        if ($request->idempotencyKey !== null) {
+            $made = $this->refundMadeUnder($request->paymentId, $request->idempotencyKey);
+            if ($made !== null) {
+                return $made;
+            }
+
+            // Stripe forgets its own idempotency keys after a day, so the key
+            // also rides on the refund, where refundMadeUnder() finds it for
+            // as long as the refund exists. The header covers two requests
+            // racing each other before either refund is listed.
+            $params['metadata'][self::REFUND_KEY] = $request->idempotencyKey;
+            $opts['idempotency_key'] = $request->idempotencyKey;
+        }
+
         try {
-            $refund = $this->stripeClient->refunds->create($params);
+            $refund = $this->stripeClient->refunds->create($params, $opts);
+        } catch (IdempotencyException $e) {
+            throw new RefundFailedException($request->paymentId, $e->getMessage(), $e);
         } catch (InvalidRequestException $e) {
             if ($e->getStripeCode() === 'resource_missing') {
                 throw new PaymentNotFoundException($request->paymentId, $e);
@@ -417,9 +438,47 @@ class StripePaymentGateway implements PaymentGatewayInterface
             throw new RefundFailedException($request->paymentId, $e->getMessage(), $e);
         }
 
+        return $this->hydrateRefund($refund, $request->paymentId);
+    }
+
+    /**
+     * The live refund already made against a payment under a key, if any. A
+     * failed or cancelled one returned no money, so it does not count.
+     */
+    private function refundMadeUnder(string $paymentId, string $key): ?Refund
+    {
+        try {
+            $refunds = $this->stripeClient->refunds->all([
+                str_starts_with($paymentId, 'ch_') ? 'charge' : 'payment_intent' => $paymentId,
+                'limit' => 100,
+            ]);
+        } catch (InvalidRequestException $e) {
+            if ($e->getStripeCode() === 'resource_missing') {
+                throw new PaymentNotFoundException($paymentId, $e);
+            }
+
+            throw new RefundFailedException($paymentId, $e->getMessage(), $e);
+        }
+
+        foreach ($refunds->data as $refund) {
+            if (($refund->metadata[self::REFUND_KEY] ?? null) !== $key) {
+                continue;
+            }
+            if (\in_array((string) $refund->status, ['failed', 'canceled'], true)) {
+                continue;
+            }
+
+            return $this->hydrateRefund($refund, $paymentId);
+        }
+
+        return null;
+    }
+
+    private function hydrateRefund(\Stripe\Refund $refund, string $paymentId): Refund
+    {
         return new Refund(
             $refund->id,
-            $request->paymentId,
+            $paymentId,
             $this->mapRefundStatus((string) $refund->status),
             $refund->amount,
             $refund->currency,
