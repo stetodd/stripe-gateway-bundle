@@ -8,6 +8,12 @@ use Psr\Log\LoggerInterface;
 use Stetodd\PaymentGateway\Exception\Payment\PaymentNotFoundException;
 use Stetodd\PaymentGateway\Exception\Payment\RefundFailedException;
 use Stetodd\PaymentGateway\Exception\Subscription\SubscriptionNotFoundException;
+use Stetodd\PaymentGateway\Model\Balance\BalanceTransaction;
+use Stetodd\PaymentGateway\Model\Balance\BalanceTransactionPage;
+use Stetodd\PaymentGateway\Model\Balance\BalanceTransactionStatus;
+use Stetodd\PaymentGateway\Model\Balance\BalanceTransactionType;
+use Stetodd\PaymentGateway\Model\Balance\FeeDetail;
+use Stetodd\PaymentGateway\Model\Balance\FeeType;
 use Stetodd\PaymentGateway\Model\Checkout\CheckoutMode;
 use Stetodd\PaymentGateway\Model\Checkout\CheckoutSession;
 use Stetodd\PaymentGateway\Model\Checkout\CheckoutStatus;
@@ -15,13 +21,22 @@ use Stetodd\PaymentGateway\Model\Checkout\CustomText;
 use Stetodd\PaymentGateway\Model\Checkout\LineItem;
 use Stetodd\PaymentGateway\Model\Checkout\Session;
 use Stetodd\PaymentGateway\Model\Customer;
+use Stetodd\PaymentGateway\Model\Invoice\PaidInvoice;
+use Stetodd\PaymentGateway\Model\Invoice\PaidInvoicePage;
 use Stetodd\PaymentGateway\Model\Payment\Payment;
+use Stetodd\PaymentGateway\Model\Payment\PaymentPage;
 use Stetodd\PaymentGateway\Model\Payment\PaymentStatus;
 use Stetodd\PaymentGateway\Model\Payment\Refund;
+use Stetodd\PaymentGateway\Model\Payment\RefundPage;
 use Stetodd\PaymentGateway\Model\Payment\RefundStatus;
+use Stetodd\PaymentGateway\Model\Payout\Payout;
+use Stetodd\PaymentGateway\Model\Payout\PayoutPage;
+use Stetodd\PaymentGateway\Model\Payout\PayoutStatus;
+use Stetodd\PaymentGateway\Model\Request\Balance\ListBalanceTransactionsRequest;
 use Stetodd\PaymentGateway\Model\Request\Checkout\CreateCheckoutSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Checkout\GetCheckoutSessionRequest;
 use Stetodd\PaymentGateway\Model\Request\Customer\CreateCustomerRequest;
+use Stetodd\PaymentGateway\Model\Request\Listing\ListSinceRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CancelPaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CapturePaymentRequest;
 use Stetodd\PaymentGateway\Model\Request\Payment\CreatePaymentHoldRequest;
@@ -40,6 +55,7 @@ use Stetodd\PaymentGateway\PaymentGatewayInterface;
 use Stripe\Exception\CardException;
 use Stripe\Exception\IdempotencyException;
 use Stripe\Exception\InvalidRequestException;
+use Stripe\Collection;
 use Stripe\Invoice;
 use Stripe\PaymentIntent;
 use Stripe\StripeClient;
@@ -335,7 +351,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
                 'capture_method' => 'manual',
                 'description' => $request->description,
                 'metadata' => $request->getMetadata(),
-            ],
+            ] + ($request->statementDescriptorSuffix !== null ? ['statement_descriptor_suffix' => $request->statementDescriptorSuffix] : []),
             'success_url' => $request->successUrl.(str_contains($request->successUrl, '?') ? '&' : '?').'session_id={CHECKOUT_SESSION_ID}',
             'cancel_url' => $request->cancelUrl,
             'metadata' => $request->getMetadata(),
@@ -358,7 +374,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
 
     public function capturePayment(CapturePaymentRequest $request): Payment
     {
-        $params = $request->amountToCapture !== null ? ['amount_to_capture' => $request->amountToCapture] : [];
+        $params = ($request->amountToCapture !== null ? ['amount_to_capture' => $request->amountToCapture] : []) + ['expand' => ['latest_charge']];
 
         try {
             $intent = $this->stripeClient->paymentIntents->capture($request->paymentId, $params);
@@ -385,7 +401,7 @@ class StripePaymentGateway implements PaymentGatewayInterface
     public function getPayment(GetPaymentRequest $request): Payment
     {
         try {
-            $intent = $this->stripeClient->paymentIntents->retrieve($request->paymentId);
+            $intent = $this->stripeClient->paymentIntents->retrieve($request->paymentId, ['expand' => ['latest_charge']]);
         } catch (InvalidRequestException $e) {
             throw new PaymentNotFoundException($request->paymentId, $e);
         }
@@ -476,6 +492,9 @@ class StripePaymentGateway implements PaymentGatewayInterface
 
     private function hydrateRefund(\Stripe\Refund $refund, string $paymentId): Refund
     {
+        $data = $refund->toArray();
+        $created = self::intIn($data['created'] ?? null);
+
         return new Refund(
             $refund->id,
             $paymentId,
@@ -483,7 +502,146 @@ class StripePaymentGateway implements PaymentGatewayInterface
             $refund->amount,
             $refund->currency,
             isset($refund->failure_reason) ? (string) $refund->failure_reason : null,
+            $created === null ? null : self::at($created),
+            self::metadataIn($data['metadata'] ?? null),
         );
+    }
+
+    /**
+     * One call for the invoices and one per invoice for the payment that paid
+     * it, which Stripe API basil moved off the invoice onto invoice payments.
+     */
+    public function listPaidInvoices(ListSinceRequest $request): PaidInvoicePage
+    {
+        $page = $this->stripeClient->invoices->all(['status' => 'paid'] + self::listParams($request));
+
+        $invoices = [];
+        foreach ($page->data as $invoice) {
+            $data = $invoice->toArray();
+            $created = self::intIn($data['created'] ?? null) ?? 0;
+            $subscription = self::arrayIn(self::arrayIn($data['parent'] ?? null)['subscription_details'] ?? null)['subscription'] ?? $data['subscription'] ?? null;
+
+            $invoices[] = new PaidInvoice(
+                $invoice->id,
+                self::intIn($data['amount_paid'] ?? null) ?? 0,
+                self::stringIn($data['currency'] ?? null) ?? 'gbp',
+                self::at(self::intIn(self::arrayIn($data['status_transitions'] ?? null)['paid_at'] ?? null) ?? $created),
+                self::at($created),
+                $this->paymentIdForInvoice($invoice->id),
+                self::idIn($subscription),
+                self::idIn($data['customer'] ?? null),
+                self::stringIn($data['billing_reason'] ?? null),
+                self::metadataIn($data['metadata'] ?? null),
+            );
+        }
+
+        return new PaidInvoicePage($invoices, self::nextCursor($page));
+    }
+
+    /**
+     * Stripe cannot filter payment intents on status, so the page is read
+     * whole and only the succeeded ones kept: a page may hold fewer than the
+     * limit and still have more after it.
+     */
+    public function listSucceededPayments(ListSinceRequest $request): PaymentPage
+    {
+        $page = $this->stripeClient->paymentIntents->all(self::listParams($request));
+
+        $payments = [];
+        foreach ($page->data as $intent) {
+            if ((string) $intent->status === 'succeeded') {
+                $payments[] = $this->hydratePayment($intent);
+            }
+        }
+
+        return new PaymentPage($payments, self::nextCursor($page));
+    }
+
+    public function listRefunds(ListSinceRequest $request): RefundPage
+    {
+        $page = $this->stripeClient->refunds->all(self::listParams($request));
+
+        $refunds = [];
+        foreach ($page->data as $refund) {
+            $data = $refund->toArray();
+            $refunds[] = $this->hydrateRefund($refund, self::idIn($data['payment_intent'] ?? null) ?? self::idIn($data['charge'] ?? null) ?? '');
+        }
+
+        return new RefundPage($refunds, self::nextCursor($page));
+    }
+
+    /**
+     * The source is expanded so a charge's or a refund's row names the
+     * payment behind it without another call per row.
+     */
+    public function listBalanceTransactions(ListBalanceTransactionsRequest $request): BalanceTransactionPage
+    {
+        $params = ['limit' => $request->limit, 'created' => self::created($request->since, $request->before)]
+            + array_filter([
+                'type' => $request->type?->value,
+                'payout' => $request->payoutId,
+                'source' => $request->sourceId,
+                'starting_after' => $request->cursor,
+            ], static fn (?string $value): bool => $value !== null)
+            + ['expand' => ['data.source']];
+
+        $page = $this->stripeClient->balanceTransactions->all($params);
+
+        $rows = [];
+        foreach ($page->data as $row) {
+            $rows[] = self::hydrateBalanceTransaction($row->toArray());
+        }
+
+        return new BalanceTransactionPage($rows, self::nextCursor($page));
+    }
+
+    /**
+     * One call: the payment with its latest charge's balance row expanded, or
+     * the charge with its own when the id is one (older invoices paid
+     * without an intent).
+     */
+    public function findPaymentBalanceTransaction(GetPaymentRequest $request): ?BalanceTransaction
+    {
+        try {
+            if (str_starts_with($request->paymentId, 'ch_')) {
+                $charge = $this->stripeClient->charges->retrieve($request->paymentId, ['expand' => ['balance_transaction']])->toArray();
+                $row = $charge['balance_transaction'] ?? null;
+                $paymentId = self::idIn($charge['payment_intent'] ?? null) ?? $request->paymentId;
+            } else {
+                $intent = $this->stripeClient->paymentIntents->retrieve($request->paymentId, ['expand' => ['latest_charge.balance_transaction']])->toArray();
+                $row = self::arrayIn($intent['latest_charge'] ?? null)['balance_transaction'] ?? null;
+                $paymentId = $request->paymentId;
+            }
+        } catch (InvalidRequestException $e) {
+            throw new PaymentNotFoundException($request->paymentId, $e);
+        }
+
+        return \is_array($row) ? self::hydrateBalanceTransaction($row, $paymentId) : null;
+    }
+
+    public function listPayouts(ListSinceRequest $request): PayoutPage
+    {
+        $page = $this->stripeClient->payouts->all(self::listParams($request));
+
+        $payouts = [];
+        foreach ($page->data as $payout) {
+            $data = $payout->toArray();
+            $status = self::stringIn($data['status'] ?? null) ?? 'pending';
+            $payouts[] = new Payout(
+                $payout->id,
+                $status === 'canceled' ? PayoutStatus::Cancelled : (PayoutStatus::tryFrom($status) ?? PayoutStatus::Pending),
+                self::intIn($data['amount'] ?? null) ?? 0,
+                self::stringIn($data['currency'] ?? null) ?? 'gbp',
+                self::at(self::intIn($data['created'] ?? null) ?? 0),
+                self::at(self::intIn($data['arrival_date'] ?? null) ?? 0),
+                ($data['automatic'] ?? true) === true,
+                self::idIn($data['balance_transaction'] ?? null),
+                self::stringIn($data['failure_code'] ?? null),
+                self::stringIn($data['description'] ?? null),
+            );
+        }
+
+        return new PayoutPage($payouts, self::nextCursor($page));
     }
 
     /**
@@ -501,6 +659,131 @@ class StripePaymentGateway implements PaymentGatewayInterface
         }
 
         return ['custom_text' => array_map(static fn (string $message): array => ['message' => $message], $params)];
+    }
+
+    /** @return array{limit: int, created: array{gte: int, lt?: int}, starting_after?: string} */
+    private static function listParams(ListSinceRequest $request): array
+    {
+        $params = ['limit' => $request->limit, 'created' => self::created($request->since, $request->before)];
+        if ($request->cursor !== null) {
+            $params['starting_after'] = $request->cursor;
+        }
+
+        return $params;
+    }
+
+    /** @return array{gte: int, lt?: int} */
+    private static function created(\DateTimeImmutable $since, ?\DateTimeImmutable $before): array
+    {
+        $created = ['gte' => $since->getTimestamp()];
+        if ($before !== null) {
+            $created['lt'] = $before->getTimestamp();
+        }
+
+        return $created;
+    }
+
+    /**
+     * Stripe pages on the last object id of the page it sent, whatever the
+     * caller kept of it.
+     *
+     * @param Collection<\Stripe\StripeObject> $page
+     */
+    private static function nextCursor(Collection $page): ?string
+    {
+        $last = $page->data === [] ? null : $page->data[\count($page->data) - 1];
+
+        return $page->has_more && $last !== null ? self::idIn($last) : null;
+    }
+
+    /** @param array<array-key, mixed> $data a balance transaction as toArray() gives it */
+    private static function hydrateBalanceTransaction(array $data, ?string $paymentId = null): BalanceTransaction
+    {
+        $rawType = self::stringIn($data['type'] ?? null) ?? 'other';
+        $source = $data['source'] ?? null;
+        $amount = self::intIn($data['amount'] ?? null) ?? 0;
+        $fee = self::intIn($data['fee'] ?? null) ?? 0;
+        $created = self::intIn($data['created'] ?? null) ?? 0;
+
+        $details = [];
+        foreach (\is_array($data['fee_details'] ?? null) ? $data['fee_details'] : [] as $detail) {
+            $detail = self::arrayIn($detail);
+            $details[] = new FeeDetail(
+                FeeType::tryFrom(self::stringIn($detail['type'] ?? null) ?? '') ?? FeeType::Other,
+                self::intIn($detail['amount'] ?? null) ?? 0,
+                self::stringIn($detail['currency'] ?? null) ?? 'gbp',
+                self::stringIn($detail['description'] ?? null),
+            );
+        }
+        $rate = $data['exchange_rate'] ?? null;
+
+        return new BalanceTransaction(
+            self::stringIn($data['id'] ?? null) ?? '',
+            BalanceTransactionType::tryFrom($rawType) ?? BalanceTransactionType::Other,
+            $rawType,
+            self::stringIn($data['reporting_category'] ?? null) ?? $rawType,
+            $amount,
+            $fee,
+            self::intIn($data['net'] ?? null) ?? $amount - $fee,
+            self::stringIn($data['currency'] ?? null) ?? 'gbp',
+            self::at($created),
+            self::at(self::intIn($data['available_on'] ?? null) ?? $created),
+            ($data['status'] ?? null) === 'available' ? BalanceTransactionStatus::Available : BalanceTransactionStatus::Pending,
+            self::idIn($source),
+            // An expanded charge or refund names its payment.
+            $paymentId ?? self::idIn(self::arrayIn($source)['payment_intent'] ?? null),
+            self::stringIn($data['description'] ?? null),
+            $details,
+            \is_float($rate) || \is_int($rate) ? (float) $rate : null,
+        );
+    }
+
+    /** An id, whether Stripe sent a bare id, an expanded object, or its array form. */
+    private static function idIn(mixed $related): ?string
+    {
+        if (\is_array($related)) {
+            $related = $related['id'] ?? null;
+        }
+
+        return self::stringIn(\is_string($related) ? $related : self::idOf($related));
+    }
+
+    /** @return array<array-key, mixed> */
+    private static function arrayIn(mixed $value): array
+    {
+        return \is_array($value) ? $value : [];
+    }
+
+    private static function stringIn(mixed $value): ?string
+    {
+        return \is_string($value) && $value !== '' ? $value : null;
+    }
+
+    private static function intIn(mixed $value): ?int
+    {
+        return \is_int($value) ? $value : null;
+    }
+
+    /** @return array<string, string> */
+    private static function metadataIn(mixed $metadata): array
+    {
+        if ($metadata instanceof \Stripe\StripeObject) {
+            $metadata = $metadata->toArray();
+        }
+
+        $strings = [];
+        foreach (\is_array($metadata) ? $metadata : [] as $key => $value) {
+            if (\is_string($value)) {
+                $strings[(string) $key] = $value;
+            }
+        }
+
+        return $strings;
+    }
+
+    private static function at(int $timestamp): \DateTimeImmutable
+    {
+        return new \DateTimeImmutable()->setTimestamp($timestamp);
     }
 
     private function paymentIdForInvoice(string $invoiceId): ?string
@@ -559,17 +842,27 @@ class StripePaymentGateway implements PaymentGatewayInterface
         };
     }
 
+    /**
+     * The card is read off the latest charge when it came back expanded, as
+     * capturePayment() and getPayment() ask for it.
+     */
     private function hydratePayment(PaymentIntent $intent): Payment
     {
-        /** @psalm-suppress UndefinedMagicPropertyFetch */
-        $captured = (int) ($intent->amount_received ?? 0);
+        $data = $intent->toArray();
+        $created = self::intIn($data['created'] ?? null);
+        $card = self::arrayIn(self::arrayIn(self::arrayIn($data['latest_charge'] ?? null)['payment_method_details'] ?? null)['card'] ?? null);
 
         return new Payment(
             $intent->id,
             $this->mapPaymentStatus((string) $intent->status),
             (int) $intent->amount,
             (string) $intent->currency,
-            $captured,
+            self::intIn($data['amount_received'] ?? null) ?? 0,
+            $created === null ? null : self::at($created),
+            self::metadataIn($data['metadata'] ?? null),
+            self::stringIn($data['description'] ?? null),
+            self::stringIn($card['brand'] ?? null),
+            self::stringIn($card['last4'] ?? null),
         );
     }
 

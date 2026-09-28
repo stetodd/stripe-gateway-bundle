@@ -371,6 +371,16 @@ final class StripePaymentGatewayTest extends TestCase
         ));
 
         self::assertArrayNotHasKey('custom_text', $this->http->lastParams());
+        self::assertArrayNotHasKey('statement_descriptor_suffix', (array) ($this->http->lastParams()['payment_intent_data'] ?? []));
+    }
+
+    public function test_a_hold_names_itself_on_the_card_statement_when_asked(): void
+    {
+        $this->http->respond('post', '/v1/checkout/sessions', ['id' => 'cs_3', 'object' => 'checkout.session', 'url' => 'https://checkout.stripe.test/cs_3']);
+
+        $this->gateway->createPaymentHoldSession(new CreatePaymentHoldRequest(new Customer('cus_1', []), 8900, 'gbp', 'EPC', 'https://app.test/ok', 'https://app.test/cancel', statementDescriptorSuffix: 'EPC'));
+
+        self::assertSame('EPC', ((array) ($this->http->lastParams()['payment_intent_data'] ?? []))['statement_descriptor_suffix'] ?? null);
     }
 
     /** @return array<string, mixed> */

@@ -66,3 +66,18 @@ Give the request an `idempotencyKey` and it pays at most once (v0.7.2). The key 
 `CreateCheckoutSessionRequest` and `CreatePaymentHoldRequest` take an optional `CustomText` (`submit`, `afterSubmit`), sent as Checkout's `custom_text`.
 
 Tests: `composer install && vendor/bin/phpunit`. Stripe is faked at the HTTP client, and nothing leaves the machine.
+
+## Listing for reconciliation (v0.8)
+
+Implements the payment-gateway v0.8 list methods over Stripe's list endpoints. Each reads one page, newest first, filtered on `created[gte]` (and `created[lt]` when `before` is set), 100 at a time by default; `nextCursor` is the last object id of the page Stripe sent and goes back as `starting_after`.
+
+- `listPaidInvoices()` — `GET /v1/invoices?status=paid`, then one `GET /v1/invoice_payments` per invoice for the payment that paid it (API basil moved it off the invoice). The subscription is read from `parent.subscription_details`.
+- `listSucceededPayments()` — `GET /v1/payment_intents`, keeping the succeeded ones (Stripe cannot filter on status, so a page may hold fewer than the limit and still have more).
+- `listRefunds()` — `GET /v1/refunds`, each against its payment intent, or its charge when it has none.
+- `listBalanceTransactions()` — `GET /v1/balance_transactions` with `expand[]=data.source`, so a charge's or refund's row names its payment intent.
+- `findPaymentBalanceTransaction()` — `GET /v1/payment_intents/{id}?expand[]=latest_charge.balance_transaction`, or the charge's own row for a `ch_` id.
+- `listPayouts()` — `GET /v1/payouts`.
+
+`capturePayment()` and `getPayment()` now expand the latest charge, so the returned `Payment` carries `cardBrand` and `cardLast4` for a receipt.
+
+A hold's `statementDescriptorSuffix` is sent as `payment_intent_data[statement_descriptor_suffix]`.
